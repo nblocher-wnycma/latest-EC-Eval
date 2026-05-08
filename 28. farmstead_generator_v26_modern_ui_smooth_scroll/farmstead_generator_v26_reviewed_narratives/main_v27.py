@@ -3,6 +3,7 @@
 This file keeps the working v26 code intact and applies targeted runtime patches for:
 - stronger grammar/redundancy cleanup before Word export
 - preserving animal inventory as a list on the front page
+- using planned BMP table dimensions more naturally in planned-action narratives
 
 Run this file instead of main.py, or use Run_Farmstead_Eval_v27.bat.
 """
@@ -19,6 +20,10 @@ App = base["App"]
 SECTIONS = base["SECTIONS"]
 QUICK_BUILD_SECTIONS = base["QUICK_BUILD_SECTIONS"]
 
+# Keep original methods so the v27 patch can wrap them without rewriting the
+# working v26 program.
+_ORIGINAL_MAKE_PLANNED_NARRATIVE = App.make_planned_narrative
+
 
 def _clean_common_text(text: str) -> str:
     """Rules-based cleanup for field-note style input."""
@@ -26,7 +31,6 @@ def _clean_common_text(text: str) -> str:
     if not text:
         return ""
 
-    # Normalize symbols and common typos seen in farmstead notes.
     replacements = {
         "&": "and",
         "witner": "winter",
@@ -54,6 +58,8 @@ def _clean_common_text(text: str) -> str:
         "storm water": "stormwater",
         "OandM": "O&M",
         "oandm": "O&M",
+        "w/": "with",
+        "UO": "underground outlet",
     }
     for bad, good in replacements.items():
         if bad.startswith(" ") or bad.endswith(" "):
@@ -61,12 +67,10 @@ def _clean_common_text(text: str) -> str:
         else:
             text = re.sub(r"\b" + re.escape(bad) + r"\b", good, text, flags=re.IGNORECASE)
 
-    # Remove placeholders/control phrases that should not appear in prose.
     text = re.sub(r"\bNo current resource concern\.?\s*", "", text, flags=re.I)
     text = re.sub(r"\bNo structural BMP\s*-\s*continue O&M\.?\s*", "", text, flags=re.I)
     text = re.sub(r"\[item #\]|\[units\]", "", text, flags=re.I)
 
-    # Basic punctuation/spacing cleanup.
     text = text.replace("County County", "County")
     text = text.replace("Basin Basin", "Basin")
     text = text.replace("Watershed Watershed", "Watershed")
@@ -77,13 +81,11 @@ def _clean_common_text(text: str) -> str:
     text = re.sub(r"\bthe the\b", "the", text, flags=re.I)
     text = re.sub(r"\b([A-Za-z]+)\s+\1\b", r"\1", text, flags=re.I)
 
-    # Improve awkward sentence starts caused by field notes.
     text = re.sub(r"\.\s+And\s+", ". ", text)
     text = re.sub(r"\.\s+But\s+", ". However, ", text)
     text = re.sub(r"\bin barn\b", "in the barn", text, flags=re.I)
     text = re.sub(r"\bis all exported\b", "is exported", text, flags=re.I)
 
-    # Capitalize sentence starts.
     def cap(match):
         return match.group(1) + match.group(2).upper()
 
@@ -92,7 +94,6 @@ def _clean_common_text(text: str) -> str:
 
 
 def _split_sentences(text: str):
-    """Split into sentences while keeping sentence punctuation."""
     text = str(text or "").strip()
     if not text:
         return []
@@ -101,7 +102,6 @@ def _split_sentences(text: str):
 
 
 def _sentence_key(sentence: str) -> str:
-    """Normalize a sentence for redundancy detection."""
     key = sentence.lower()
     key = re.sub(r"\([^)]*\)", "", key)
     key = re.sub(r"[^a-z0-9\s]", " ", key)
@@ -123,14 +123,12 @@ def _too_similar(new_key: str, previous_keys):
         if not old_words:
             continue
         overlap = len(new_words & old_words) / max(len(new_words), 1)
-        # Removes near-duplicate boilerplate without deleting needed technical details.
         if overlap >= 0.82 and len(new_words & old_words) >= 7:
             return True
     return False
 
 
 def _dedupe_sentences(text: str) -> str:
-    """Remove repeated or near-repeated sentences from generated narratives."""
     sentences = _split_sentences(text)
     output = []
     keys = []
@@ -139,15 +137,12 @@ def _dedupe_sentences(text: str) -> str:
         if not cleaned:
             continue
         lowered = cleaned.lower()
-
-        # Remove overly redundant no-concern boilerplate when it already appears.
         if "no significant resource concern" in lowered:
             if any("no significant resource concern" in s.lower() for s in output):
                 continue
         if "continued operation and maintenance" in lowered:
             if any("continued operation and maintenance" in s.lower() for s in output):
                 continue
-
         key = _sentence_key(cleaned)
         if _too_similar(key, keys):
             continue
@@ -161,17 +156,131 @@ def _dedupe_sentences(text: str) -> str:
     return final
 
 
-def improved_proofread_text(self, text):
-    """Improved deterministic grammar/flow cleanup.
+def _parse_practice_table(raw: str):
+    """Parse Standard|Item #|Description|Units rows from the Quick Build table."""
+    rows = []
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line or line.lower().startswith("standard"):
+            continue
+        if "|" not in line:
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        parts += [""] * (4 - len(parts))
+        practice, item, desc, units = parts[:4]
+        if not practice:
+            continue
+        if not units or units.lower() in {"[units]", "units", "n/a", "na", "none"}:
+            continue
+        rows.append({"practice": practice, "item": item, "desc": desc or practice, "units": units})
+    return rows
 
-    This is intentionally conservative: it cleans grammar/flow problems and removes
-    repeated boilerplate, but it does not invent farm facts.
+
+def _dimension_connector(units: str) -> str:
+    lower = units.lower().strip()
+    if " x " in lower or "'x" in lower or "’x" in lower or " by " in lower:
+        return "measuring"
+    if any(term in lower for term in ["sq", "square", "ac", "acre"]):
+        return "covering"
+    if any(term in lower for term in ["lf", "linear", " ft", "feet", "foot"]):
+        return "totaling approximately"
+    if re.fullmatch(r"\d+(\.\d+)?", lower):
+        return "with a planned quantity of"
+    return "with planned units of"
+
+
+def _clean_dimension_text(text: str) -> str:
+    text = _clean_common_text(text).rstrip(".")
+    text = text.replace("Sq. Ft", "square feet")
+    text = text.replace("Sq Ft", "square feet")
+    text = text.replace("sq. ft", "square feet")
+    text = text.replace("sq ft", "square feet")
+    text = re.sub(r"\bLf\.?\b", "linear feet", text, flags=re.I)
+    return text
+
+
+def _practice_dimension_phrase(row):
+    desc = _clean_dimension_text(row.get("desc") or row.get("practice") or "planned practice")
+    practice = _clean_dimension_text(row.get("practice") or "")
+    units = _clean_dimension_text(row.get("units") or "")
+    if not units:
+        return ""
+
+    # If the description is just the practice name, do not repeat it.
+    if practice and desc.lower() == practice.lower():
+        label = practice
+    else:
+        label = desc
+        if practice and practice.lower() not in desc.lower():
+            label = f"{desc} ({practice})"
+
+    connector = _dimension_connector(units)
+    return f"{label} {connector} {units}"
+
+
+def _list_phrase(items):
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def planned_bmp_sizing_sentence(self, section):
+    """Create a natural sizing sentence from the planned BMP table."""
+    selected = self.get_widget_value("Quick Build Wizard", f"{section} - Selected Practices")
+    if not selected:
+        selected = self.get_widget_value(section, "NRCS Standards and Units Used")
+    rows = _parse_practice_table(selected)
+    phrases = [_practice_dimension_phrase(row) for row in rows]
+    phrases = [p for p in phrases if p]
+    if not phrases:
+        return ""
+    return "Based on the planned BMP table, the proposed work includes " + _list_phrase(phrases) + "."
+
+
+def _insert_after_first_sentence(text: str, insert_sentence: str) -> str:
+    text = str(text or "").strip()
+    insert_sentence = str(insert_sentence or "").strip()
+    if not text or not insert_sentence:
+        return text
+    if insert_sentence.lower() in text.lower():
+        return text
+    sentences = _split_sentences(text)
+    if not sentences:
+        return text + " " + insert_sentence
+    return " ".join([sentences[0], insert_sentence] + sentences[1:])
+
+
+def improved_make_planned_narrative(self, section, subject, practices, concern_yes, loc, size, action_language, om_language):
+    """Use planned BMP table dimensions in a clearer way.
+
+    The base narrative used one generic sentence like "Approximate planned dimensions
+    or units include...". This patch reads each BMP table row and writes a more useful
+    sentence tying each practice/description to its own units.
     """
+    sizing_sentence = planned_bmp_sizing_sentence(self, section)
+
+    # If we have a real sizing sentence from the BMP table, do not also pass the
+    # generic size field into the base method; that avoids repeated sizing language.
+    size_for_base = "" if sizing_sentence else size
+    narrative = _ORIGINAL_MAKE_PLANNED_NARRATIVE(
+        self, section, subject, practices, concern_yes, loc, size_for_base, action_language, om_language
+    )
+    if sizing_sentence:
+        narrative = _insert_after_first_sentence(narrative, sizing_sentence)
+    return improved_quality_check_narrative(self, narrative)
+
+
+def improved_proofread_text(self, text):
+    """Improved deterministic grammar/flow cleanup."""
     text = str(text or "").strip()
     if not text:
         return ""
 
-    # Preserve bullet/list formatting by proofreading each line separately.
     if "\n" in text or "•" in text:
         cleaned_lines = []
         for raw_line in text.splitlines():
@@ -188,24 +297,19 @@ def improved_proofread_text(self, text):
                 line = re.sub(r"^[-*]\s+", "", line).strip()
             line = _clean_common_text(line)
             if line and bullet:
-                # Animal inventory bullets should not be forced into full sentences.
                 line = line.rstrip(".")
             elif line and line[-1] not in ".!?:":
                 line += "."
             cleaned_lines.append(bullet + line if line else "")
-        # Keep list line breaks, but remove excessive blank lines.
         out = "\n".join(cleaned_lines)
         out = re.sub(r"\n{3,}", "\n\n", out).strip()
         return out
 
     text = _clean_common_text(text)
-
-    # Convert semicolon-separated notes into sentences, then dedupe.
     text = re.sub(r"\s*;\s*", ". ", text)
     text = _clean_common_text(text)
     text = _dedupe_sentences(text)
 
-    # Capitalize final output and ensure terminal punctuation.
     def cap(match):
         return match.group(1) + match.group(2).upper()
 
@@ -221,8 +325,6 @@ def improved_quality_check_narrative(self, text):
     if "\n" in text:
         return text
     text = _dedupe_sentences(text)
-
-    # Remove common repeated transitions while preserving meaning.
     text = re.sub(
         r"Based on the conditions observed during the evaluation, this area does not appear to be creating a significant resource concern at this time\.\s+Based on the conditions observed during the evaluation,",
         "Based on the conditions observed during the evaluation,",
@@ -239,7 +341,6 @@ def improved_clean_paragraph(self, text):
 
 def improved_proofread_all_report_text(self):
     """Run grammar/flow cleanup while preserving the animal inventory list."""
-    # Front page: preserve Overview line breaks because it contains the animal inventory list.
     front_fields = [
         "Introduction Narrative",
         "Animal Housing and Feed Management Narrative",
@@ -268,7 +369,6 @@ def improved_bullet_inventory(self, raw):
         line = _clean_common_text(line).strip().strip("•-").strip()
         if not line or line.lower().startswith("example"):
             continue
-        # Do not add sentence periods to animal inventory bullets.
         line = line.rstrip(".")
         lines.append(f"• {line}")
     return "\n".join(lines)
@@ -293,6 +393,7 @@ def improved_add_paragraphs(self, container, text):
 
 
 # Apply patches to the existing app class.
+App.make_planned_narrative = improved_make_planned_narrative
 App.proofread_text = improved_proofread_text
 App.quality_check_narrative = improved_quality_check_narrative
 App.clean_paragraph = improved_clean_paragraph
