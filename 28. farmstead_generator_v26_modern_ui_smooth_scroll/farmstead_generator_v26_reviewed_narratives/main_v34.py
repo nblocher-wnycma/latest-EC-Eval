@@ -60,6 +60,13 @@ UNIT_REPLACEMENTS = [
     (r"\bLF\b", "linear feet"),
 ]
 
+TERM_REPLACEMENTS = [
+    (r"\bstorm\s+water\b", "stormwater"),
+    (r"\brun\s+off\b", "runoff"),
+    (r"\bclean\s+rain\s+water\b", "clean rainwater"),
+    (r"\bBMP's\b", "BMPs"),
+]
+
 LONG_LIST_REPLACEMENTS = {
     "ditches, wetlands, streams, wells, poorly drained soils, or other sensitive areas": "nearby sensitive areas",
     "ditches, wetlands, streams, wells, poorly drained soils and other sensitive areas": "nearby sensitive areas",
@@ -98,6 +105,13 @@ SENTENCE_STOP_WORDS = {
 def normalize_units(text: str) -> str:
     """Normalize common unit shorthand while preserving numeric values."""
     for pattern, replacement in UNIT_REPLACEMENTS:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text
+
+
+def normalize_terminology(text: str) -> str:
+    """Normalize common CNMP/EC terminology variants."""
+    for pattern, replacement in TERM_REPLACEMENTS:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
 
@@ -229,6 +243,7 @@ def proofread_paragraph(text: str) -> str:
 
     text = correct_common_typos(text)
     text = normalize_units(text)
+    text = normalize_terminology(text)
     text = remove_placeholders(text)
     text = simplify_long_lists(text)
     text = clean_bmp_dimension_language(text)
